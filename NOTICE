@@ -1,0 +1,10 @@
+Herdr Open Local Paths
+
+patches/herdr-0.9.5-local-paths.patch contains modifications derived from
+Herdr, distributed under the Apache License, Version 2.0.
+
+Upstream: https://github.com/herdrdev/herdr
+Base revision: ee5bfb5041bb3e4a49d591c72308aae3c81ecdde
+
+The opener plugin and accompanying documentation are also distributed
+under the Apache License, Version 2.0. This is not an official Herdr release.

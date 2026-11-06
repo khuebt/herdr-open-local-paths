@@ -1,0 +1,187 @@
+diff --git a/docs/next/website/src/content/docs/plugins.mdx b/docs/next/website/src/content/docs/plugins.mdx
+index 98ddc44..b534bbf 100644
+--- a/docs/next/website/src/content/docs/plugins.mdx
++++ b/docs/next/website/src/content/docs/plugins.mdx
+@@ -388,3 +388,7 @@ manifests at the root or in subdirectories of the repository's default branch.
+ One repository card can contain multiple separately installable plugins. The
+ index refreshes every 30 minutes. See
+ [Marketplace](/docs/marketplace/) for how discovery works.
++
++### Local path links in custom builds
++
++The local-path patch recognizes plain ASCII file and folder paths on Ctrl+click and passes their visible text to matching plugin link handlers. Relative paths must be resolved against `focused_pane_cwd` in `HERDR_PLUGIN_CONTEXT_JSON`. A handler should verify the target exists before opening it. No escape sequences need to be printed, and existing HTTP(S) and explicit OSC 8 link behavior is preserved.
+diff --git a/src/app/actions.rs b/src/app/actions.rs
+index f01dd05..375a6b0 100644
+--- a/src/app/actions.rs
++++ b/src/app/actions.rs
+@@ -1045,11 +1045,64 @@ pub(super) fn url_from_link_target(target: crate::ghostty::LinkTarget) -> Option
+     match target {
+         crate::ghostty::LinkTarget::Uri(uri) => Some(uri),
+         crate::ghostty::LinkTarget::Text { text, clicked_byte } => {
+-            url_at_byte(&text, clicked_byte).map(str::to_owned)
++            terminal_link_byte_range(&text, clicked_byte)
++                .and_then(|range| text.get(range).map(str::to_owned))
+         }
+     }
+ }
+ 
++/// Recognize plain ASCII paths without changing the terminal's displayed text.
++pub(super) fn terminal_link_byte_range(
++    text: &str,
++    clicked_byte: usize,
++) -> Option<std::ops::Range<usize>> {
++    if let Some(range) = url_byte_range(text, clicked_byte) {
++        return Some(range);
++    }
++    for quote in ['"', '\''] {
++        if let Some(start) = text.get(..clicked_byte)?.rfind(quote) {
++            let start = start + 1;
++            if let Some(end) = text[start..].find(quote).map(|end| start + end) {
++                let candidate = &text[start..end];
++                if clicked_byte < end
++                    && candidate.is_ascii()
++                    && !candidate.chars().any(char::is_control)
++                    && !candidate.contains("://")
++                    && (candidate.contains('/') || candidate.contains('.'))
++                {
++                    return Some(start..end);
++                }
++            }
++        }
++    }
++    let allowed = |byte: u8| byte.is_ascii_alphanumeric() || b"/._~-:".contains(&byte);
++    let bytes = text.as_bytes();
++    if !bytes.get(clicked_byte).copied().is_some_and(allowed) {
++        return None;
++    }
++    let mut start = clicked_byte;
++    while start > 0 && allowed(bytes[start - 1]) {
++        start -= 1;
++    }
++    let mut end = clicked_byte + 1;
++    while end < bytes.len() && allowed(bytes[end]) {
++        end += 1;
++    }
++    if (start > 0 && !bytes[start - 1].is_ascii()) || (end < bytes.len() && !bytes[end].is_ascii())
++    {
++        return None;
++    }
++    let candidate = &text[start..end];
++    if candidate.contains("://")
++        || candidate == "."
++        || candidate == ".."
++        || (!candidate.contains('/') && !candidate.contains('.'))
++    {
++        return None;
++    }
++    Some(start..end)
++}
++
+ pub(crate) fn safe_web_url(url: &str) -> Option<&str> {
+     (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
+ }
+@@ -1097,6 +1150,7 @@ pub(crate) fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
+     Some(span.columns(&cells))
+ }
+ 
++#[cfg(test)]
+ fn url_at_byte(text: &str, clicked_byte: usize) -> Option<&str> {
+     let range = url_byte_range(text, clicked_byte)?;
+     text.get(range)
+@@ -4728,3 +4782,34 @@ mod tests {
+         assert_eq!(state.workspaces[0].display_name(), "notes");
+     }
+ }
++
++#[cfg(test)]
++mod local_path_link_tests {
++    use super::terminal_link_byte_range;
++
++    #[test]
++    fn plain_paths_keep_their_display_text_and_urls_keep_priority() {
++        for path in [
++            "plans/task/plan.md",
++            "/tmp/report.md",
++            "../docs/",
++            "README.md",
++            "./src/main.rs:12:3",
++            "https://example.com/doc",
++        ] {
++            let text = format!("see {path} now");
++            let range = terminal_link_byte_range(&text, 5).unwrap();
++            assert_eq!(&text[range], path);
++        }
++        let text = "see \"docs/a report.md\" now";
++        let range = terminal_link_byte_range(text, 14).unwrap();
++        assert_eq!(&text[range], "docs/a report.md");
++    }
++
++    #[test]
++    fn ordinary_words_and_partial_unicode_paths_are_not_links() {
++        assert!(terminal_link_byte_range("ordinary", 2).is_none());
++        assert!(terminal_link_byte_range("báo.md", 5).is_none());
++        assert!(terminal_link_byte_range("ssh://host/tmp/file", 14).is_none());
++    }
++}
+diff --git a/src/app/api/plugins/mod.rs b/src/app/api/plugins/mod.rs
+index 62051a8..9ac576a 100644
+--- a/src/app/api/plugins/mod.rs
++++ b/src/app/api/plugins/mod.rs
+@@ -319,7 +319,7 @@ impl App {
+         params: PaneLinkActivateParams,
+     ) -> String {
+         match self.read_checked_pane_link(&id, &params, "resolution", |runtime, col, row| {
+-            runtime.link_regions_at(col, row, crate::app::actions::url_byte_range)
++            runtime.link_regions_at(col, row, crate::app::actions::terminal_link_byte_range)
+         }) {
+             Ok((_, regions)) => encode_success(id, ResponseResult::PaneLinkResolved { regions }),
+             Err(error) => error,
+@@ -813,6 +813,48 @@ mod tests {
+     };
+     use std::time::{SystemTime, UNIX_EPOCH};
+ 
++    #[tokio::test]
++    async fn pane_plain_local_path_resolves_and_activates_without_osc8() {
++        let mut app = test_app();
++        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local-links")];
++        app.state.ensure_test_terminals();
++        app.state.active = Some(0);
++        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
++        let public_id = app.public_pane_id(0, pane_id).unwrap();
++        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
++            .attached_terminal_id
++            .clone();
++        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
++        runtime.test_process_pty_bytes(b"plans/task/plan.md");
++        let revision = runtime.content_seq();
++        app.terminal_runtimes.insert(terminal_id, runtime);
++        let params = PaneLinkActivateParams {
++            pane_id: public_id,
++            viewport_row: 0,
++            col: 4,
++            content_revision: Some(revision),
++            offset_from_bottom: Some(0),
++        };
++        let response = app.handle_api_request(Request {
++            id: "hover-local".into(),
++            method: Method::PaneLinkResolve(params.clone()),
++        });
++        assert!(
++            matches!(response_result(&response), ResponseResult::PaneLinkResolved { regions } if !regions.is_empty())
++        );
++        let response = app.handle_api_request(Request {
++            id: "click-local".into(),
++            method: Method::PaneLinkActivate(params),
++        });
++        assert!(
++            matches!(response_result(&response), ResponseResult::PaneLinkActivated { url: Some(url), handled: false } if url == "plans/task/plan.md")
++        );
++        assert!(
++            rx.try_recv().is_err(),
++            "link interaction must not write to the PTY"
++        );
++    }
++
+     #[tokio::test]
+     async fn pane_link_resolve_checks_staleness_without_side_effects() {
+         let mut app = test_app();
